@@ -1,0 +1,22 @@
+import {PGlite} from '@electric-sql/pglite';
+import {readFile,readdir} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
+import assert from 'node:assert/strict';
+async function main(){
+ const db=new PGlite();await db.exec(await readFile('tests/bootstrap.sql','utf8'));
+ const actor=randomUUID();await db.query("insert into auth.users values($1,'profit@example.test',now())",[actor]);
+ for(const name of(await readdir('supabase/migrations')).filter(x=>x.endsWith('.sql')).sort())await db.exec(await readFile(`supabase/migrations/${name}`,'utf8'));
+ await db.query("insert into public.partners(id,slot,email,display_name) values($1,1,'profit@example.test','اختبار')",[actor]);await db.query("select set_config('request.jwt.claim.sub',$1,false)",[actor]);await db.exec('set role authenticated');
+ async function tx(type:string,count:number|null,amount:string|null,id:string=randomUUID(),version:number|null=null){await db.query('select public.save_transaction($1,$2::jsonb,$3)',[id,JSON.stringify({type,sheep_count:count,amount,transaction_date:'2026-01-01',expense_category:type==='expense'?'أعلاف':null}),version]);return id;}
+ async function metrics(){return (await db.query<{m:any}>('select public.get_dashboard() m')).rows[0].m;}
+ async function scenario(name:string,fn:()=>Promise<void>){await db.exec('begin');try{await fn();console.log('✓ '+name);}finally{await db.exec('rollback');}}
+ await scenario('Zero purchases and expense-only state avoid division by zero',async()=>{let m=await metrics();assert.equal(m.average_cost,'0.00');assert.equal(m.inventory_value,'0.00');assert.equal(m.net_profit,'0.00');await tx('expense',null,'25.00');m=await metrics();assert.equal(m.net_profit,'-25.00');});
+ await scenario('Agreed example produces 3 heads, inventory 3000, profit 1500',async()=>{await tx('purchase',10,'10000');await tx('sale',6,'9000');await tx('loss',1,'99999');await tx('expense',null,'500');const m=await metrics();assert.equal(m.inventory,3);assert.equal(m.average_cost,'1000.00');assert.equal(m.inventory_value,'3000.00');assert.equal(m.net_profit,'1500.00');assert.equal(m.cash,'-1500.00');});
+ await scenario('Different batches use count-weighted cost, not average batch price',async()=>{await tx('purchase',2,'2000');await tx('purchase',8,'16000');await tx('sale',2,'4000');await tx('loss',1,null);await tx('expense',null,'500');const m=await metrics();assert.equal(m.average_cost,'1800.00');assert.equal(m.inventory_value,'12600.00');assert.equal(m.net_profit,'-1900.00');});
+ await scenario('Loss estimate edit never changes cash or profit; count edit does',async()=>{await tx('purchase',10,'10000');const id=await tx('loss',1,'100');const before=await metrics();await tx('loss',1,'5000',id,1);assert.deepEqual(await metrics(),before);await tx('loss',2,'5000',id,2);let m=await metrics();assert.equal(m.net_profit,'-2000.00');assert.equal(m.cash,before.cash);await db.query('select public.delete_transaction($1,3)',[id]);m=await metrics();assert.equal(m.inventory_value,'10000.00');assert.equal(m.net_profit,'0.00');});
+ await scenario('No stock means zero inventory value, including total loss',async()=>{await tx('purchase',3,'1000');await tx('loss',3,'2');const m=await metrics();assert.equal(m.inventory_value,'0.00');assert.equal(m.net_profit,'-1000.00');});
+ await scenario('Unrounded average is used before currency rounding',async()=>{await tx('purchase',3,'1000');await tx('sale',1,'400');const m=await metrics();assert.equal(m.average_cost,'333.33');assert.equal(m.inventory_value,'666.67');assert.equal(m.net_profit,'66.67');});
+ await scenario('Capital excluded, purchase changes and deletion recalculate',async()=>{const id=await tx('purchase',2,'2000');await tx('sale',1,'1500');for(const movement_type of ['deposit','withdrawal'])await db.query('select public.save_capital($1,$2::jsonb,null)',[randomUUID(),JSON.stringify({movement_type,amount:movement_type==='deposit'?'5000':'300',movement_date:'2026-01-01',partner_id:actor})]);assert.equal((await metrics()).net_profit,'500.00');await tx('purchase',2,'2400',id,1);assert.equal((await metrics()).net_profit,'300.00');const extra=await tx('purchase',1,'600');assert.equal((await metrics()).average_cost,'1000.00');await db.query('select public.delete_transaction($1,1)',[extra]);assert.equal((await metrics()).average_cost,'1200.00');});
+ await db.close();console.log('7 profit scenarios passed in isolated PostgreSQL.');
+}
+main().catch(e=>{console.error(e);process.exit(1);});

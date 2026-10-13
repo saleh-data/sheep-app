@@ -1,0 +1,11 @@
+project_id = "sheep-trading"
+[auth]
+enable_signup = false
+enable_anonymous_sign_ins = false
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3000/auth/recovery/"]
+[auth.email]
+enable_signup = false
+enable_confirmations = true
+[functions.upload-attachment]
+verify_jwt = false
